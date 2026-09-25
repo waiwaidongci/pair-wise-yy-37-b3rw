@@ -29,8 +29,18 @@ python3 app.py --db ./data.db --port 8314
 - `POST /api/items`
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
+- `POST /api/items/{id}/records/{record_id}/close`，关闭整改/检查事项
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
 - `GET /api/audit`
+
+许可续期：
+
+- `POST /api/items/{id}/renewals`：申请人发起续期，填写`proposed_capacity`（拟变更产能）、`effective_date`（生效日期，YYYY-MM-DD）、`materials`（材料清单，每项含`kind`/`detail`），一个许可单只允许一件未结束申请（draft/submitted/returned）。
+- `POST /api/renewals/{id}/update`：仅draft或returned状态可补充修改，必须提交`expected_version`。
+- `POST /api/renewals/{id}/submit`：提交复核，材料清单中必须同时含`test_report`（检测报告）和`facility_operation`（治理设施运行记录），否则退回409。
+- `POST /api/renewals/{id}/review`：合规管理员（compliance_manager）复核，必须提交`expected_version`。拟变更产能超过许可量（threshold）或存在未关闭事项时退回`returned`，`comment`为必填意见；否则通过`approved`，生成新许可版本和到期日（生效日期+5年），见`GET /api/items/{id}/permits`。
+- `GET /api/items/{id}/renewals`、`GET /api/renewals/{id}`：续期申请全程可查，已结束的旧申请保留。
+- 续期状态机：`draft → submitted →（returned → submitted）* → approved`，申请人负责发起/补充/提交，合规管理员负责复核。
 
 允许角色：applicant, inspector, compliance_manager, viewer。申报量超过许可量或检查发现高严重度问题时提高优先级；存在未关闭整改时不能批准。
 

@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ID_PREFIX, RENEWAL_STATES, STATES
 
 
 class Repository:
@@ -24,6 +24,8 @@ class Repository:
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        renewal_statuses = ",".join("'" + s.replace("'", "''") + "'" for s in RENEWAL_STATES)
+        open_renewal_statuses = ",".join("'" + s.replace("'", "''") + "'" for s in RENEWAL_STATES[:-1])
         with self.conn:
             self.conn.executescript(f"""
                 CREATE TABLE IF NOT EXISTS items (
@@ -53,6 +55,35 @@ class Repository:
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
+                );
+                CREATE TABLE IF NOT EXISTS renewals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    proposed_capacity REAL NOT NULL,
+                    effective_date TEXT NOT NULL,
+                    materials TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL CHECK(status IN ({renewal_statuses})),
+                    review_comment TEXT,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_renewals_open
+                    ON renewals(item_id) WHERE status IN ({open_renewal_statuses});
+                CREATE TABLE IF NOT EXISTS permit_versions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    renewal_id INTEGER NOT NULL REFERENCES renewals(id),
+                    version INTEGER NOT NULL,
+                    capacity REAL NOT NULL,
+                    effective_date TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, version)
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,6 +187,161 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def close_record(self, record_id: int, actor: str) -> Dict[str, Any]:
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE records SET status='closed' WHERE id=?", (record_id,)
+            )
+            if cur.rowcount == 0:
+                raise NotFoundError("记录不存在")
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+        return dict(row)
+
+    def update_item_capacity(self, item_id: int, capacity: float) -> None:
+        now = utc_now()
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE items SET quantity=?, version=version+1, updated_at=? WHERE id=?",
+                (capacity, now, item_id),
+            )
+
+    @staticmethod
+    def _renewal(row: sqlite3.Row) -> Dict[str, Any]:
+        result = dict(row)
+        result["materials"] = json.loads(result["materials"])
+        return result
+
+    def create_renewal(self, item_id: int, proposed_capacity: float,
+                       effective_date: str, materials: list, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO renewals(item_id, proposed_capacity, effective_date,
+                       materials, status, version, created_by, created_at, updated_at)
+                       VALUES(?,?,?,?, 'draft', 1, ?, ?, ?)""",
+                    (item_id, proposed_capacity, effective_date,
+                     json.dumps(materials, ensure_ascii=False), actor, now, now),
+                )
+                renewal_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("该许可单已有未结束的续期申请") from exc
+        return self.get_renewal(renewal_id)
+
+    def get_renewal(self, renewal_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM renewals WHERE id=?", (renewal_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("续期申请不存在")
+        return self._renewal(row)
+
+    def list_renewals(self, item_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM renewals WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+        return [self._renewal(row) for row in rows]
+
+    def update_renewal(self, renewal_id: int, proposed_capacity: float,
+                       effective_date: str, materials: list, expected_version: int) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE renewals SET proposed_capacity=?, effective_date=?, materials=?,
+                   version=version+1, updated_at=?, review_comment=NULL, reviewed_by=NULL,
+                   reviewed_at=NULL
+                   WHERE id=? AND version=? AND status IN ('draft','returned')""",
+                (proposed_capacity, effective_date,
+                 json.dumps(materials, ensure_ascii=False), now, renewal_id, expected_version),
+            )
+            if cur.rowcount == 0:
+                row = self.conn.execute("SELECT status FROM renewals WHERE id=?", (renewal_id,)).fetchone()
+                if row is None:
+                    raise NotFoundError("续期申请不存在")
+                if row["status"] not in ("draft", "returned"):
+                    raise ConflictError("只有草稿或退回的申请才能补充修改")
+                raise ConflictError("版本冲突，请刷新后重试")
+        return self.get_renewal(renewal_id)
+
+    def submit_renewal(self, renewal_id: int, expected_version: int) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE renewals SET status='submitted', version=version+1, updated_at=?,
+                   review_comment=NULL, reviewed_by=NULL, reviewed_at=NULL
+                   WHERE id=? AND version=? AND status IN ('draft','returned')""",
+                (now, renewal_id, expected_version),
+            )
+            if cur.rowcount == 0:
+                row = self.conn.execute("SELECT status FROM renewals WHERE id=?", (renewal_id,)).fetchone()
+                if row is None:
+                    raise NotFoundError("续期申请不存在")
+                raise ConflictError("版本冲突，请刷新后重试")
+        return self.get_renewal(renewal_id)
+
+    def transition_renewal(self, renewal_id: int, target: str, expected_version: int,
+                           actor: str, comment: Optional[str],
+                           from_statuses: tuple) -> Dict[str, Any]:
+        now = utc_now()
+        placeholders = ",".join("?" for _ in from_statuses)
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                f"""UPDATE renewals SET status=?, version=version+1, updated_at=?,
+                   review_comment=?, reviewed_by=?, reviewed_at=?
+                   WHERE id=? AND version=? AND status IN ({placeholders})""",
+                (target, now, comment, actor, now, renewal_id, expected_version,
+                 *from_statuses),
+            )
+            if cur.rowcount == 0:
+                row = self.conn.execute("SELECT status FROM renewals WHERE id=?", (renewal_id,)).fetchone()
+                if row is None:
+                    raise NotFoundError("续期申请不存在")
+                raise ConflictError("版本冲突，请刷新后重试")
+        return self.get_renewal(renewal_id)
+
+    def approve_renewal(self, renewal_id: int, item_id: int, capacity: float,
+                        effective_date: str, expires_at: str, expected_version: int,
+                        actor: str, comment: Optional[str]) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT COALESCE(MAX(version),0) AS v FROM permit_versions WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+            next_version = int(row["v"]) + 1
+            cur = self.conn.execute(
+                """UPDATE renewals SET status='approved', version=version+1, updated_at=?,
+                   review_comment=?, reviewed_by=?, reviewed_at=?
+                   WHERE id=? AND version=? AND status='submitted'""",
+                (now, comment, actor, now, renewal_id, expected_version),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute("SELECT 1 FROM renewals WHERE id=?", (renewal_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("续期申请不存在")
+                raise ConflictError("版本冲突，请刷新后重试")
+            self.conn.execute(
+                """INSERT INTO permit_versions(item_id, renewal_id, version, capacity,
+                   effective_date, expires_at, created_by, created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (item_id, renewal_id, next_version, capacity, effective_date,
+                 expires_at, actor, now),
+            )
+            self.conn.execute(
+                """UPDATE items SET quantity=?, version=version+1, updated_at=? WHERE id=?""",
+                (capacity, now, item_id),
+            )
+        return self.get_renewal(renewal_id)
+
+    def list_permit_versions(self, item_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM permit_versions WHERE item_id=? ORDER BY version DESC",
+                (item_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
