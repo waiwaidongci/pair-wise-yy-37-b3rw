@@ -32,7 +32,17 @@ python3 app.py --db ./data.db --port 8314
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
 - `GET /api/audit`
 
-允许角色：applicant, inspector, compliance_manager, viewer。申报量超过许可量或检查发现高严重度问题时提高优先级；存在未关闭整改时不能批准。
+许可续期（补续期办理）：
+
+- `POST /api/items/{id}/renewals`：申请人发起续期申请，填写`proposed_capacity`（拟变更产能）和`effective_date`（生效日期）；一个许可单同时只能有一件未结束申请
+- `GET /api/items/{id}/renewals`：查询该许可单全部续期申请（含已通过的历史申请）
+- `GET /api/renewals/{id}`：申请详情，含材料清单和缺失必备材料
+- `POST /api/renewals/{id}/materials`：补充材料，`kind`为`test_report`（检测报告）、`facility_operation_record`（治理设施运行记录）或`other`
+- `POST /api/renewals/{id}/amend`：草稿或退回状态下修改拟变更产能和生效日期，必须提交`expected_version`
+- `POST /api/renewals/{id}/submit`：提交复核，必须提交`expected_version`；检测报告和治理设施运行记录缺一不能提交
+- `POST /api/renewals/{id}/review`：合规经理复核，必须提交`expected_version`；产能超许可量或仍有未关闭事项时退回补充且必须填写`comment`，通过后签发新许可版本和到期日
+
+允许角色：applicant, inspector, compliance_manager, viewer。申报量超过许可量或检查发现高严重度问题时提高优先级；存在未关闭整改时不能批准。续期通过后许可版本号递增，到期日按生效日期顺延5年，历史申请仍可查询。
 
 ## 测试
 

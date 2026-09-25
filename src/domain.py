@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 class ErrorKind:
     VALIDATION="validation"; NOT_FOUND="not_found"; FORBIDDEN="forbidden"; CONFLICT="conflict"
 class DomainError(Exception):
@@ -20,6 +21,12 @@ class Record:
 @dataclass(frozen=True)
 class AuditEntry:
     id:int; action:str; entity_type:str; entity_id:int; actor:str; detail:Dict[str,Any]; previous_hash:str; entry_hash:str; created_at:str
+@dataclass(frozen=True)
+class RenewalApplication:
+    id:int; item_id:int; proposed_capacity:float; effective_date:str; status:str; version:int; review_comment:Optional[str]; issued_version:Optional[int]; issued_expires_at:Optional[str]; created_by:str; created_at:str; updated_at:str
+@dataclass(frozen=True)
+class RenewalMaterial:
+    id:int; renewal_id:int; kind:str; detail:str; external_ref:Optional[str]; created_by:str; created_at:str
 def require_text(value,field,max_length=2000):
     if not isinstance(value,str) or not value.strip(): raise ValidationError(f"{field}不能为空")
     value=value.strip()
@@ -34,5 +41,14 @@ def require_number(value,field,minimum=0.0):
     except (TypeError,ValueError): raise ValidationError(f"{field}必须是数字")
     if number<minimum: raise ValidationError(f"{field}不能小于{minimum}")
     return number
+def require_date(value,field):
+    if not isinstance(value,str): raise ValidationError(f"{field}必须是YYYY-MM-DD格式的日期")
+    value=value.strip()
+    try: parsed=datetime.strptime(value,"%Y-%m-%d")
+    except ValueError: raise ValidationError(f"{field}必须是YYYY-MM-DD格式的有效日期")
+    return parsed.date().isoformat()
+def require_version(value,field="expected_version"):
+    if isinstance(value,bool) or not isinstance(value,int) or value<1: raise ValidationError(f"{field}必须是正整数")
+    return value
 def ensure_role(role,allowed):
     if role not in allowed: raise PermissionDenied("当前角色无权执行该操作")
